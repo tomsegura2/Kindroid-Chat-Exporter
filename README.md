@@ -1,6 +1,6 @@
 # Kindroid Chat Exporter
 
-A simple command-line Python tool for exporting chat messages from a Kindroid AI using Kindroid’s official API.
+A simple command-line Python tool for exporting chat messages from a Kindroid AI using Kindroid’s official API (for official documentation, see https://kindroid.ai/docs/article/api-documentation/). 
 
 This script prompts for your Kindroid API key and AI ID, downloads messages using the `/get-chat-messages` endpoint, respects rate limits, and saves progress as it goes so interrupted exports can be resumed.
 
