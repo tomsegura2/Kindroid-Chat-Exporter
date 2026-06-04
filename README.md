@@ -260,6 +260,6 @@ Use it responsibly, respect Kindroid’s rate limits, and keep your API key priv
 
 ## License
 
-MIT License
+Apache 2.0
 
 You are free to use, modify, and distribute this script, provided you include the license notice.
