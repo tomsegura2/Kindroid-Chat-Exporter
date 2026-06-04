@@ -1,15 +1,16 @@
 # Kindroid Chat Exporter
 
-A simple command-line Python tool for exporting chat messages from a Kindroid AI using Kindroid’s official API (for official documentation, see https://kindroid.ai/docs/article/api-documentation/). 
+A simple command-line Python tool for exporting chat messages from a Kindroid AI or group chat using Kindroid's official API (for official documentation, see https://kindroid.ai/docs/article/api-documentation/).
 
-This script prompts for your Kindroid API key and AI ID, downloads messages using the `/get-chat-messages` endpoint, respects rate limits, and saves progress as it goes so interrupted exports can be resumed.
+This script prompts for your Kindroid API key and AI ID (or group ID), downloads messages using the `/get-chat-messages` endpoint, handles rate limits and transient server errors automatically, and saves progress as it goes so interrupted exports can be resumed.
 
 ## Features
 
-* Exports chat history for a single Kindroid AI
+* Exports chat history for a single Kindroid AI **or group chat**
 * Prompts for your API key securely instead of hardcoding it
-* Uses the maximum supported page size of `100`
+* Explicitly requests the maximum supported page size of `100` (API default is `50`)
 * Handles rate limiting with `Retry-After` support and exponential backoff
+* **Retries automatically on transient 5xx server errors** instead of aborting
 * Saves a checkpoint after every successful page
 * Resumes from the last saved timestamp if interrupted
 * Writes exported messages to a readable JSON file
@@ -19,7 +20,7 @@ This script prompts for your Kindroid API key and AI ID, downloads messages usin
 
 * Python 3.9 or newer
 * A Kindroid API key beginning with `kn_`
-* The AI ID of the Kindroid you want to export
+* The AI ID of the Kindroid you want to export, or a group ID for group chats
 * The `requests` Python package
 
 Install the required package:
@@ -30,7 +31,7 @@ pip install requests
 
 ## Getting Your API Key and AI ID
 
-Your Kindroid API key and AI ID can be found in Kindroid’s Profile Settings.
+Your Kindroid API key and AI ID can be found in Kindroid's Profile Settings.
 
 Your API key is sensitive. Anyone with access to it may be able to perform actions on your Kindroid account. Do not share it, publish it, commit it to GitHub, or paste it into untrusted tools.
 
@@ -52,19 +53,25 @@ python app.py
 The script will prompt you for:
 
 1. Your Kindroid API key
-2. The AI ID you want to export
-3. An optional output filename
+2. Whether you are exporting a single AI or a group chat
+3. The AI ID or group ID you want to export
+4. An optional output filename
 
-Example:
+Example (single AI export):
 
 ```text
 Kindroid Chat Exporter
 ======================
 
-This exports messages for one Kindroid AI using your kn_ API key.
+Exports messages for a Kindroid AI or group chat using your kn_ API key.
 Your API key is only used locally for this script and is not saved.
 
 Enter your Kindroid API key, starting with kn_:
+
+Export type:
+  1) Single AI  (ai_id)
+  2) Group chat (group_id)
+Choose [1/2, default 1]:
 Enter the AI ID to export:
 Output file [kindroid_export_abc123.json]:
 ```
@@ -73,7 +80,7 @@ When complete, the script will save the exported messages to a JSON file.
 
 ## Output Format
 
-The exported file is a JSON array of message objects.
+The exported file is a JSON array of message objects, ordered oldest first.
 
 Example:
 
@@ -90,7 +97,7 @@ Example:
 ]
 ```
 
-Depending on the message, additional fields may be present, such as:
+Depending on the message, additional fields may be present:
 
 ```json
 {
@@ -103,17 +110,35 @@ Depending on the message, additional fields may be present, such as:
 }
 ```
 
-Fields that do not apply to a message may be omitted.
+Fields that do not apply to a message are omitted by the API.
 
-## Rate Limits
+The full set of possible fields per message is:
+
+| Field | Description |
+|---|---|
+| `id` | Unique message identifier |
+| `sender` | Sender identifier |
+| `sender_type` | `"ai"` or `"user"` |
+| `display_name` | Display name of the sender |
+| `timestamp` | Unix timestamp in milliseconds |
+| `message` | Message text |
+| `image_urls` | Array of image URLs attached to the message |
+| `image_description` | Description of attached image |
+| `video_description` | Description of attached video |
+| `internet_response` | Internet search response content |
+| `link_url` | URL attached to the message |
+| `link_description` | Description of the attached link |
+
+## Rate Limits and Server Errors
+
+### Rate limiting (429)
 
 Kindroid may return a `429 Too Many Requests` response if the script sends requests too quickly.
 
 This script handles that by:
 
-* Waiting when rate limited
 * Respecting the `Retry-After` header if Kindroid provides one
-* Falling back to exponential backoff when no retry time is provided
+* Falling back to exponential backoff with jitter when no retry time is provided
 * Adding a small randomized delay between successful requests
 * Saving progress after every page
 
@@ -131,6 +156,10 @@ sleep_for = random.uniform(10.0, 20.0)
 
 Do not run multiple exports in parallel. That will likely trigger rate limits more aggressively.
 
+### Server errors (5xx)
+
+Transient server-side errors (`500`, `502`, `503`, `504`) are retried automatically using the same exponential backoff logic as rate limits. The export will not abort on a single server hiccup.
+
 ## Resuming an Interrupted Export
 
 The script creates a checkpoint file named:
@@ -139,19 +168,27 @@ The script creates a checkpoint file named:
 kindroid_export_checkpoint.json
 ```
 
-If the export is interrupted, run the script again with the same AI ID. The script will detect the checkpoint and ask whether you want to resume.
+If the export is interrupted for any reason — rate limiting, a network drop, a `KeyboardInterrupt`, or a transient server error — run the script again with the same AI ID or group ID. The script will detect the checkpoint and ask whether you want to resume.
 
 Example:
 
 ```text
-Found a previous checkpoint for this AI.
-Previous output file: kindroid_export_abc123.json
+Found a previous checkpoint for this export.
+Previous output file : kindroid_export_abc123.json
 Messages already saved: 1200
-Last timestamp: 1770000000000
+Last timestamp        : 1770000000000
 Resume from this checkpoint? [Y/n]:
 ```
 
 Choose `Y` or press Enter to continue from where the previous run stopped.
+
+## Group Chat Support
+
+The script supports exporting group chats in addition to single-AI histories. When prompted for export type, choose option `2` and enter your group ID.
+
+Group chats require an active Kindroid subscription. If your account does not have the required subscription level, the API will return `403 Forbidden`.
+
+Group IDs can be found in the Kindroid app. Groups must be created in the app; this script only exports from existing groups.
 
 ## Security Notes
 
@@ -178,35 +215,14 @@ If you want to commit example data, create a sanitized sample file instead.
 
 ## Limitations
 
-This script exports messages for one AI ID at a time.
+This script exports messages for one AI ID or group ID at a time.
 
 It does not currently:
 
 * Automatically discover all of your Kindroid AIs
 * Automatically discover group chat IDs
 * Export all account data in one step
-* Export group chats unless modified to use `group_id`
 * Decrypt or process older unofficial Firestore/archive formats
-
-The Kindroid API endpoint supports both `ai_id` and `group_id`, but this version of the script is focused on single-AI exports for simplicity.
-
-## Group Chat Support
-
-The official API also supports fetching messages by `group_id`.
-
-To adapt the script for group chats, replace the request parameter:
-
-```python
-"ai_id": ai_id
-```
-
-with:
-
-```python
-"group_id": group_id
-```
-
-A future version may add a prompt allowing the user to choose between AI export and group chat export.
 
 ## Troubleshooting
 
@@ -217,8 +233,7 @@ Your API key was rejected.
 Check that:
 
 * The key starts with `kn_`
-* The key was copied correctly
-* There are no extra spaces before or after the key
+* The key was copied correctly with no extra spaces
 
 ### `403 Forbidden`
 
@@ -226,8 +241,7 @@ The request is not allowed.
 
 Possible causes:
 
-* The AI ID does not belong to your account
-* Your account does not have access to the requested resource
+* The AI ID or group ID does not belong to your account
 * You are trying to access a group chat without the required subscription status
 
 ### `400 Bad Request`
@@ -236,27 +250,31 @@ The request was malformed.
 
 Check that:
 
-* You entered the correct AI ID
-* You are using only one identifier type at a time
+* You entered the correct AI ID or group ID
+* You selected the correct export type (AI vs. group chat)
 * The API endpoint has not changed
 
 ### `429 Too Many Requests`
 
 Kindroid is rate limiting the export.
 
-The script should pause and retry automatically. If this happens repeatedly, increase the delay between successful requests.
+The script will pause and retry automatically using the `Retry-After` header or exponential backoff. If this happens repeatedly, increase the delay between successful requests (see [Rate Limits and Server Errors](#rate-limits-and-server-errors)).
+
+### `500` / `502` / `503` / `504` Server Errors
+
+The script retries these automatically with exponential backoff. If retries are consistently failing, the Kindroid API may be experiencing an outage. The export will abort after the backoff ceiling is exceeded; your checkpoint will be preserved and the export can be resumed once the service recovers.
 
 ### Export Stops Midway
 
-Run the script again. If a checkpoint exists, the script should offer to resume.
+Run the script again with the same AI ID or group ID. If a checkpoint exists, the script will offer to resume.
 
 ## Disclaimer
 
-This is an unofficial utility for personal data export using Kindroid’s documented API behavior.
+This is an unofficial utility for personal data export using Kindroid's documented API.
 
 It is not affiliated with, endorsed by, or maintained by Kindroid.
 
-Use it responsibly, respect Kindroid’s rate limits, and keep your API key private.
+Use it responsibly, respect Kindroid's rate limits, and keep your API key private.
 
 ## License
 
