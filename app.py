@@ -2,23 +2,29 @@
 """
 Kindroid Chat Exporter
 
-Exports all messages for a single Kindroid AI using the official
+Exports all messages for a single Kindroid AI or group chat using the official
 /get-chat-messages endpoint.
 
 Features:
-- Prompts for API key and AI ID
+- Prompts for API key and AI ID (or group ID)
 - Hides API key input
-- Uses max page size: limit=100
-- Respects rate limits with Retry-After + exponential backoff
-- Saves progress after every page
-- Can resume from checkpoint
+- Explicitly requests the maximum page size of 100 (API default is 50)
+- Handles 429 rate limits with Retry-After support and exponential backoff
+- Retries on transient 5xx server errors with exponential backoff
+- Saves a checkpoint after every successful page
+- Resumes from the last saved timestamp if interrupted
 - Writes a clean JSON export file
+
+Message fields exported (fields absent on a given message are omitted):
+  id, sender, sender_type, display_name, timestamp, message,
+  image_urls, image_description, video_description,
+  internet_response, link_url, link_description
 
 Install dependency:
     pip install requests
 
 Run:
-    python kindroid_export.py
+    python app.py
 """
 
 import json
@@ -31,10 +37,17 @@ from datetime import datetime
 import requests
 
 
-BASE_URL = "https://api.kindroid.ai/v1/get-chat-messages"
+BASE_URL = "https://api.kindroid.ai/v1"
+GET_CHAT_MESSAGES_URL = f"{BASE_URL}/get-chat-messages"
+
+# The API accepts 1–100; explicitly request the maximum.
+# The API default is 50 — do not omit this parameter if you want full pages.
 MAX_LIMIT = 100
 
 CHECKPOINT_FILE = Path("kindroid_export_checkpoint.json")
+
+# Transient server-side status codes that should be retried rather than aborted.
+RETRYABLE_STATUS_CODES = {500, 502, 503, 504}
 
 
 def prompt_nonempty(prompt_text: str) -> str:
@@ -55,7 +68,11 @@ def safe_filename(value: str) -> str:
     return "".join(keep)
 
 
-def load_checkpoint(ai_id: str):
+def load_checkpoint(identifier: str):
+    """
+    Load a checkpoint for the given ai_id or group_id.
+    Returns the checkpoint dict, or None if none exists or it doesn't match.
+    """
     if not CHECKPOINT_FILE.exists():
         return None
 
@@ -65,15 +82,30 @@ def load_checkpoint(ai_id: str):
         print("Checkpoint file exists, but could not be read. Ignoring it.")
         return None
 
-    if checkpoint.get("ai_id") != ai_id:
+    # Support both old (ai_id-keyed) and new (identifier-keyed) checkpoints.
+    stored_id = checkpoint.get("identifier") or checkpoint.get("ai_id")
+    if stored_id != identifier:
         return None
 
     return checkpoint
 
 
-def save_checkpoint(ai_id: str, output_file: str, last_timestamp, message_count: int):
+def save_checkpoint(
+    identifier: str,
+    id_type: str,
+    output_file: str,
+    last_timestamp,
+    message_count: int,
+):
+    """
+    Persist pagination state so the export can be resumed after an interruption.
+
+    identifier : the ai_id or group_id value
+    id_type    : "ai_id" or "group_id"
+    """
     checkpoint = {
-        "ai_id": ai_id,
+        "identifier": identifier,
+        "id_type": id_type,
         "output_file": output_file,
         "last_timestamp": last_timestamp,
         "message_count": message_count,
@@ -86,21 +118,21 @@ def save_checkpoint(ai_id: str, output_file: str, last_timestamp, message_count:
     )
 
 
-def request_page_with_backoff(headers, params):
+def request_page_with_backoff(headers: dict, params: dict) -> dict:
     """
-    Makes a GET request while respecting rate limits.
+    GET /get-chat-messages with automatic retry on rate limits and server errors.
 
-    If Kindroid returns 429:
-    - Uses Retry-After header if present
-    - Otherwise uses exponential backoff with jitter
+    Retry behaviour:
+      429  — waits for Retry-After (if provided) or uses exponential backoff
+      5xx  — uses exponential backoff (transient server-side errors)
+      4xx  — raises immediately (caller error, retrying will not help)
     """
-
     delay = 10
     max_delay = 300
 
     while True:
         response = requests.get(
-            BASE_URL,
+            GET_CHAT_MESSAGES_URL,
             headers=headers,
             params=params,
             timeout=90,
@@ -125,7 +157,17 @@ def request_page_with_backoff(headers, params):
             print("Progress is saved, so this can safely take its time.")
 
             time.sleep(sleep_for)
+            delay = min(delay * 2, max_delay)
+            continue
 
+        if response.status_code in RETRYABLE_STATUS_CODES:
+            sleep_for = delay + random.uniform(0, 3)
+            print()
+            print(
+                f"Server error {response.status_code}. "
+                f"Retrying in {sleep_for:.1f} seconds..."
+            )
+            time.sleep(sleep_for)
             delay = min(delay * 2, max_delay)
             continue
 
@@ -138,12 +180,13 @@ def request_page_with_backoff(headers, params):
         if response.status_code == 403:
             raise RuntimeError(
                 "Forbidden. The API key is valid, but this request is not allowed. "
-                "Check that the AI ID belongs to this account."
+                "Check that the AI ID (or group ID) belongs to this account, and that "
+                "your subscription level permits the requested resource."
             )
 
         if response.status_code == 400:
             raise RuntimeError(
-                f"Bad request. Check your AI ID.\n\nServer said:\n{response.text}"
+                f"Bad request. Check your AI ID or group ID.\n\nServer said:\n{response.text}"
             )
 
         raise RuntimeError(
@@ -151,7 +194,19 @@ def request_page_with_backoff(headers, params):
         )
 
 
-def export_ai_messages(api_key: str, ai_id: str, output_file: Path, resume: bool = True):
+def export_messages(
+    api_key: str,
+    identifier: str,
+    id_type: str,
+    output_file: Path,
+    resume: bool = True,
+) -> list:
+    """
+    Paginate through /get-chat-messages and write every message to output_file.
+
+    identifier : the value of ai_id or group_id
+    id_type    : "ai_id" or "group_id"
+    """
     headers = {
         "Authorization": f"Bearer {api_key}",
     }
@@ -160,17 +215,17 @@ def export_ai_messages(api_key: str, ai_id: str, output_file: Path, resume: bool
     start_after_timestamp = None
 
     if resume:
-        checkpoint = load_checkpoint(ai_id)
+        checkpoint = load_checkpoint(identifier)
 
         if checkpoint:
             previous_file = Path(checkpoint["output_file"])
 
             if previous_file.exists():
                 print()
-                print("Found a previous checkpoint for this AI.")
-                print(f"Previous output file: {previous_file}")
+                print("Found a previous checkpoint for this export.")
+                print(f"Previous output file : {previous_file}")
                 print(f"Messages already saved: {checkpoint.get('message_count', 0)}")
-                print(f"Last timestamp: {checkpoint.get('last_timestamp')}")
+                print(f"Last timestamp        : {checkpoint.get('last_timestamp')}")
 
                 choice = input("Resume from this checkpoint? [Y/n]: ").strip().lower()
 
@@ -192,12 +247,14 @@ def export_ai_messages(api_key: str, ai_id: str, output_file: Path, resume: bool
     page_number = 1
 
     while True:
-        params = {
-            "ai_id": ai_id,
+        # The API accepts exactly one of ai_id or group_id — never both.
+        params: dict = {
+            id_type: identifier,
             "limit": MAX_LIMIT,
         }
 
         if start_after_timestamp is not None:
+            # Must be a number (Unix ms timestamp), not a string.
             params["start_after_timestamp"] = start_after_timestamp
 
         print()
@@ -220,15 +277,17 @@ def export_ai_messages(api_key: str, ai_id: str, output_file: Path, resume: bool
 
         last_timestamp = pagination.get("lastTimestamp")
         has_more = pagination.get("hasMore", False)
+        returned_limit = pagination.get("limit")
 
         save_checkpoint(
-            ai_id=ai_id,
+            identifier=identifier,
+            id_type=id_type,
             output_file=str(output_file),
             last_timestamp=last_timestamp,
             message_count=len(all_messages),
         )
 
-        print(f"Fetched {len(messages)} messages.")
+        print(f"Fetched {len(messages)} messages (page limit reported by API: {returned_limit}).")
         print(f"Total saved: {len(all_messages)} messages.")
 
         if not has_more:
@@ -245,7 +304,7 @@ def export_ai_messages(api_key: str, ai_id: str, output_file: Path, resume: bool
         page_number += 1
 
         # Gentle pacing even when not rate-limited.
-        # Increase this if Kindroid is still hitting you with 429s constantly.
+        # Increase this if Kindroid is still hitting you with 429s.
         sleep_for = random.uniform(2.0, 5.0)
         print(f"Waiting {sleep_for:.1f} seconds before the next page...")
         time.sleep(sleep_for)
@@ -257,7 +316,7 @@ def main():
     print("Kindroid Chat Exporter")
     print("======================")
     print()
-    print("This exports messages for one Kindroid AI using your kn_ API key.")
+    print("Exports messages for a Kindroid AI or group chat using your kn_ API key.")
     print("Your API key is only used locally for this script and is not saved.")
     print()
 
@@ -271,22 +330,34 @@ def main():
             print("Canceled.")
             return
 
-    ai_id = prompt_nonempty("Enter the AI ID to export: ")
+    print()
+    print("Export type:")
+    print("  1) Single AI  (ai_id)")
+    print("  2) Group chat (group_id)")
+    export_type = input("Choose [1/2, default 1]: ").strip()
 
-    default_name = f"kindroid_export_{safe_filename(ai_id)}.json"
+    if export_type == "2":
+        id_type = "group_id"
+        identifier = prompt_nonempty("Enter the group ID to export: ")
+    else:
+        id_type = "ai_id"
+        identifier = prompt_nonempty("Enter the AI ID to export: ")
+
+    default_name = f"kindroid_export_{safe_filename(identifier)}.json"
     output_input = input(f"Output file [{default_name}]: ").strip()
     output_file = Path(output_input or default_name)
 
     print()
     print("Starting export.")
-    print(f"AI ID: {ai_id}")
+    print(f"{'Group ID' if id_type == 'group_id' else 'AI ID'}: {identifier}")
     print(f"Output file: {output_file}")
     print()
 
     try:
-        messages = export_ai_messages(
+        messages = export_messages(
             api_key=api_key,
-            ai_id=ai_id,
+            identifier=identifier,
+            id_type=id_type,
             output_file=output_file,
             resume=True,
         )
@@ -296,7 +367,11 @@ def main():
         print(output_file.resolve())
 
         if CHECKPOINT_FILE.exists():
-            cleanup = input("Delete checkpoint file now that export is complete? [Y/n]: ").strip().lower()
+            cleanup = (
+                input("Delete checkpoint file now that export is complete? [Y/n]: ")
+                .strip()
+                .lower()
+            )
             if cleanup in ("", "y", "yes"):
                 CHECKPOINT_FILE.unlink()
                 print("Checkpoint deleted.")
