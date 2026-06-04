@@ -40,7 +40,7 @@ Your API key is sensitive. Anyone with access to it may be able to perform actio
 Clone this repository or download the script:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/kindroid-chat-exporter.git
+git clone https://github.com/tomsegura2/kindroid-chat-exporter.git
 cd kindroid-chat-exporter
 ```
 
