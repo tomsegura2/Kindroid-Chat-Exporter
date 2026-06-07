@@ -41,6 +41,7 @@ import json
 import time
 import random
 import getpass
+import sys
 from xml.sax.saxutils import escape
 from pathlib import Path
 from datetime import datetime
@@ -69,6 +70,13 @@ def print_header():
     print()
     print("Kindroid Chat Exporter")
     print("======================")
+
+
+def configure_console_encoding():
+    """Avoid UnicodeEncodeError in packaged Windows console builds."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
 
 
 def print_divider():
@@ -890,6 +898,7 @@ def show_session_summary(session_log: list):
 # ---------------------------------------------------------------------------
 
 def main():
+    configure_console_encoding()
     print_header()
     print()
     print("  Save your Kindroid chat history to your computer.")
@@ -921,11 +930,24 @@ def main():
                 print()
                 print("  Your API key can be found in the Kindroid app:")
                 print("  Profile → Settings → API Key")
-                print("  It starts with kn_ and is safe to paste here — it stays on your computer.")
+                print("  It starts with kn_ and stays on your computer — it is never uploaded.")
                 print()
-                api_key = getpass.getpass(
-                    "  Paste your API key here (it won't be visible as you type): "
-                ).strip()
+                print("  How would you like to enter your API key?")
+                print("    1) Hidden  — characters are invisible as you type (more secure)")
+                print("    2) Visible — characters appear as you type (easier to check for typos)")
+                print()
+                visibility_choice = input("  Choose [1/2, default 1]: ").strip()
+                print()
+
+                if visibility_choice == "2":
+                    api_key = input("  Paste your API key here: ").strip()
+                    if api_key:
+                        preview = api_key[:6] + "*" * max(0, len(api_key) - 6)
+                        print(f"  Key entered: {preview}  ({len(api_key)} characters)")
+                else:
+                    api_key = getpass.getpass(
+                        "  Paste your API key here (it won't be visible as you type): "
+                    ).strip()
 
                 if not api_key.startswith("kn_"):
                     print()
