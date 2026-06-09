@@ -942,8 +942,7 @@ def main():
                 if visibility_choice == "2":
                     api_key = input("  Paste your API key here: ").strip()
                     if api_key:
-                        preview = api_key[:6] + "*" * max(0, len(api_key) - 6)
-                        print(f"  Key entered: {preview}  ({len(api_key)} characters)")
+                        print(f"  Key entered successfully ({len(api_key)} characters).")
                 else:
                     api_key = getpass.getpass(
                         "  Paste your API key here (it won't be visible as you type): "
