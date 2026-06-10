@@ -1,7 +1,6 @@
 # Kindroid Chat Exporter
 
 [![CodeQL Advanced](https://github.com/tomsegura2/Kindroid-Chat-Exporter/actions/workflows/codeql.yml/badge.svg)](https://github.com/tomsegura2/Kindroid-Chat-Exporter/actions/workflows/codeql.yml)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/{owner}/{repo}/badge)](https://scorecard.dev/viewer/?uri=github.com/{owner}/{repo})
 
 
 A simple command-line Python tool for exporting chat messages from a Kindroid AI or group chat using Kindroid's official API (for official documentation, see https://kindroid.ai/docs/article/api-documentation/).
