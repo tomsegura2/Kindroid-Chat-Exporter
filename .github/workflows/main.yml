@@ -1,2 +1,4 @@
 name: OSSF Scorecard action
 uses: ossf/scorecard-action@v2.4.3
+name: Attest Build Provenance
+uses: actions/attest-build-provenance@v4.1.0
