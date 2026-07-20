@@ -2,6 +2,8 @@
 
 [![CodeQL Advanced](https://github.com/tomsegura2/Kindroid-Chat-Exporter/actions/workflows/codeql.yml/badge.svg)](https://github.com/tomsegura2/Kindroid-Chat-Exporter/actions/workflows/codeql.yml)
 
+[![Quality gate status](https://sonarcloud.io/api/project_badges/measure?project=tomsegura2_Kindroid-Chat-Exporter&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=tomsegura2_Kindroid-Chat-Exporter)
+
 A Python utility for exporting chat histories from Kindroid AI characters and group chats using Kindroid's official API.
 
 The exporter downloads your messages directly from Kindroid, saves them locally, supports automatic resume after interruptions, and can convert exports into multiple formats including JSON, JSONL, Markdown, plain text, and PDF.
