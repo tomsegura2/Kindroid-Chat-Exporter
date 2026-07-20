@@ -56,7 +56,8 @@ GET_CHAT_MESSAGES_URL = f"{BASE_URL}/get-chat-messages"
 # The API default is 50 — do not omit this parameter if you want full pages.
 MAX_LIMIT = 100
 
-CHECKPOINT_FILE = Path("kindroid_export_checkpoint.json")
+APP_ROOT = Path.cwd().resolve()
+CHECKPOINT_FILE = APP_ROOT / "kindroid_export_checkpoint.json"
 
 # Transient server-side status codes that should be retried rather than aborted.
 RETRYABLE_STATUS_CODES = {500, 502, 503, 504}
@@ -96,6 +97,34 @@ def safe_filename(value: str) -> str:
     return "".join(
         c if (c.isalnum() or c in ("-", "_")) else "_"
         for c in value
+    )
+
+
+
+def validated_path(value: str | Path, *, root: Path | None = None) -> Path:
+    """Resolve a filesystem path and optionally require it to stay under root."""
+    raw_value = str(value)
+    if "\x00" in raw_value:
+        raise ValueError("Paths may not contain null bytes.")
+
+    candidate = Path(raw_value).expanduser().resolve(strict=False)
+    if root is not None:
+        allowed_root = root.expanduser().resolve(strict=False)
+        try:
+            candidate.relative_to(allowed_root)
+        except ValueError as exc:
+            raise ValueError(
+                f"Path must stay inside {allowed_root}: {candidate}"
+            ) from exc
+    return candidate
+
+
+def write_json_file(output_file: Path, data) -> None:
+    """Write JSON consistently after validating the destination path."""
+    safe_output = validated_path(output_file)
+    safe_output.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False),
+        encoding="utf-8",
     )
 
 
@@ -157,23 +186,32 @@ def add_single_ai_display_names(
 # ---------------------------------------------------------------------------
 
 def load_checkpoint(identifier: str):
-    """
-    Return the checkpoint dict for identifier, or None if absent / mismatched.
-    Supports both old (ai_id-keyed) and new (identifier-keyed) checkpoint files.
-    """
+    """Return a matching, validated checkpoint dictionary, or None."""
     if not CHECKPOINT_FILE.exists():
         return None
 
     try:
         checkpoint = json.loads(CHECKPOINT_FILE.read_text(encoding="utf-8"))
-    except Exception:
+    except (OSError, json.JSONDecodeError, TypeError):
         print("  Checkpoint file exists but could not be read. Ignoring it.")
+        return None
+
+    if not isinstance(checkpoint, dict):
         return None
 
     stored_id = checkpoint.get("identifier") or checkpoint.get("ai_id")
     if stored_id != identifier:
         return None
 
+    output_value = checkpoint.get("output_file")
+    if not isinstance(output_value, str):
+        return None
+
+    try:
+        checkpoint["output_file"] = str(validated_path(output_value, root=APP_ROOT))
+    except ValueError:
+        print("  Checkpoint contains an unsafe output path. Ignoring it.")
+        return None
     return checkpoint
 
 
@@ -185,122 +223,188 @@ def save_checkpoint(
     message_count: int,
 ):
     """Persist pagination state so an export can be resumed after interruption."""
+    safe_output = validated_path(output_file, root=APP_ROOT)
     checkpoint = {
         "identifier": identifier,
         "id_type": id_type,
-        "output_file": output_file,
+        "output_file": str(safe_output),
         "last_timestamp": last_timestamp,
         "message_count": message_count,
         "saved_at": datetime.now().isoformat(timespec="seconds"),
     }
-    CHECKPOINT_FILE.write_text(
-        json.dumps(checkpoint, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    write_json_file(CHECKPOINT_FILE, checkpoint)
 
 
-def cleanup_checkpoint():
+def cleanup_checkpoint(delete_choice: bool | None = None):
     """Delete the checkpoint file if it exists, after confirming with the user."""
-    if CHECKPOINT_FILE.exists():
-        choice = (
-            input("  Delete checkpoint file now that export is complete? [Y/n]: ")
-            .strip()
-            .lower()
-        )
-        if choice in ("", "y", "yes"):
-            CHECKPOINT_FILE.unlink()
-            print("  Checkpoint deleted.")
+    if not CHECKPOINT_FILE.exists():
+        return
+
+    should_delete = delete_choice
+    if should_delete is None:
+        choice = input(
+            "  Delete checkpoint file now that export is complete? [Y/n]: "
+        ).strip().lower()
+        should_delete = choice in ("", "y", "yes")
+
+    if should_delete:
+        CHECKPOINT_FILE.unlink()
+        print("  Checkpoint deleted.")
 
 
 # ---------------------------------------------------------------------------
 # HTTP layer
 # ---------------------------------------------------------------------------
 
-def request_page_with_backoff(headers: dict, params: dict) -> dict:
-    """
-    GET /get-chat-messages with automatic retry on rate limits and server errors.
+def _emit(log_callback, message: str = "") -> None:
+    if log_callback:
+        log_callback(message)
+    else:
+        print(message)
 
-    Retry behaviour:
-      429  — waits for Retry-After (if provided) or uses exponential backoff
-      5xx  — uses exponential backoff (transient server-side errors)
-      4xx  — raises immediately (caller error; retrying will not help)
-    """
-    delay = 10
-    max_delay = 300
+
+def _retry_delay(response, delay: float) -> float:
+    retry_after = response.headers.get("Retry-After")
+    if retry_after:
+        try:
+            return float(retry_after)
+        except ValueError:
+            return delay
+    return delay + random.uniform(0, 3)
+
+
+def _describe_http_error(response) -> str:
+    messages = {
+        401: (
+            "Your API key was not recognised by Kindroid.\n"
+            "  • Make sure it starts with kn_\n"
+            "  • Copy it again from Kindroid → Profile → Settings\n"
+            "  • Check there are no extra spaces before or after it"
+        ),
+        403: (
+            "Kindroid won't allow this export.\n"
+            "  • Make sure the AI ID (or group ID) belongs to your account\n"
+            "  • Group chat exports may require a paid Kindroid subscription"
+        ),
+        400: (
+            "Kindroid didn't understand the request — the AI ID or group ID "
+            "may be incorrect.\n"
+            "  • Copy it again from Kindroid → Profile → Settings\n"
+            f"  • Details: {response.text}"
+        ),
+    }
+    return messages.get(
+        response.status_code,
+        f"Something unexpected went wrong (server returned code {response.status_code}).\n"
+        "  • Check your internet connection and try again\n"
+        "  • Your progress has been saved and the export can be resumed\n"
+        f"  • Details: {response.text}",
+    )
+
+
+def request_page_with_backoff(headers: dict, params: dict, log_callback=None) -> dict:
+    """Fetch one page, retrying rate limits and transient server failures."""
+    delay = 10.0
+    max_delay = 300.0
 
     while True:
         response = requests.get(
-            GET_CHAT_MESSAGES_URL,
-            headers=headers,
-            params=params,
-            timeout=90,
+            GET_CHAT_MESSAGES_URL, headers=headers, params=params, timeout=90
         )
-
         if response.status_code == 200:
             return response.json()
 
+        retryable = response.status_code == 429 or response.status_code in RETRYABLE_STATUS_CODES
+        if not retryable:
+            raise RuntimeError(_describe_http_error(response))
+
+        sleep_for = _retry_delay(response, delay)
+        _emit(log_callback)
         if response.status_code == 429:
-            retry_after = response.headers.get("Retry-After")
-            if retry_after:
-                try:
-                    sleep_for = int(retry_after)
-                except ValueError:
-                    sleep_for = delay
-            else:
-                sleep_for = delay + random.uniform(0, 3)
-
-            print()
-            print(f"  Kindroid has asked us to slow down. Pausing for {sleep_for:.1f} seconds...")
-            print("  Your progress is saved — no need to do anything, just wait.")
-            time.sleep(sleep_for)
-            delay = min(delay * 2, max_delay)
-            continue
-
-        if response.status_code in RETRYABLE_STATUS_CODES:
-            sleep_for = delay + random.uniform(0, 3)
-            print()
-            print(
-                f"  Kindroid's server hit a snag. "
-                f"Trying again in {sleep_for:.1f} seconds — your progress is safe."
+            _emit(
+                log_callback,
+                f"  Kindroid has asked us to slow down. Pausing for {sleep_for:.1f} seconds...",
             )
-            time.sleep(sleep_for)
-            delay = min(delay * 2, max_delay)
-            continue
-
-        if response.status_code == 401:
-            raise RuntimeError(
-                "Your API key was not recognised by Kindroid.\n"
-                "  • Make sure it starts with kn_\n"
-                "  • Copy it again from Kindroid → Profile → Settings\n"
-                "  • Check there are no extra spaces before or after it"
+            _emit(log_callback, "  Your progress is saved — no need to do anything, just wait.")
+        else:
+            _emit(
+                log_callback,
+                f"  Kindroid's server hit a snag. Trying again in {sleep_for:.1f} "
+                "seconds — your progress is safe.",
             )
-
-        if response.status_code == 403:
-            raise RuntimeError(
-                "Kindroid won't allow this export.\n"
-                "  • Make sure the AI ID (or group ID) belongs to your account\n"
-                "  • Group chat exports may require a paid Kindroid subscription"
-            )
-
-        if response.status_code == 400:
-            raise RuntimeError(
-                "Kindroid didn't understand the request — the AI ID or group ID "
-                "may be incorrect.\n"
-                "  • Copy it again from Kindroid → Profile → Settings\n"
-                f"  • Details: {response.text}"
-            )
-
-        raise RuntimeError(
-            f"Something unexpected went wrong (server returned code {response.status_code}).\n"
-            "  • Check your internet connection and try again\n"
-            "  • Your progress has been saved and the export can be resumed\n"
-            f"  • Details: {response.text}"
-        )
+        time.sleep(sleep_for)
+        delay = min(delay * 2, max_delay)
 
 
 # ---------------------------------------------------------------------------
 # Core export logic
 # ---------------------------------------------------------------------------
+
+def _load_resumable_export(
+    identifier: str,
+    id_type: str,
+    output_file: Path,
+    character_name: str,
+    user_name: str,
+    resume_choice: bool | None,
+    log_callback,
+) -> tuple[Path, list, object]:
+    checkpoint = load_checkpoint(identifier)
+    if not checkpoint:
+        return output_file, [], None
+
+    previous_file = validated_path(checkpoint["output_file"], root=APP_ROOT)
+    if not previous_file.exists():
+        return output_file, [], None
+
+    _emit(log_callback)
+    _emit(log_callback, "  It looks like a previous export was interrupted partway through.")
+    _emit(log_callback, f"  File       : {previous_file}")
+    _emit(log_callback, f"  Saved so far: {checkpoint.get('message_count', 0):,} messages")
+
+    should_resume = resume_choice
+    if should_resume is None:
+        choice = input("  Pick up where it left off? [Y/n]: ").strip().lower()
+        should_resume = choice in ("", "y", "yes")
+    if not should_resume:
+        _emit(log_callback, "  Starting a fresh export.")
+        return output_file, [], None
+
+    try:
+        all_messages = load_exported_messages(previous_file)
+    except (OSError, ValueError):
+        _emit(log_callback, "  Could not read previous output file. Starting fresh.")
+        return output_file, [], None
+
+    if id_type == "ai_id":
+        added_names = add_single_ai_display_names(
+            all_messages, character_name=character_name, user_name=user_name
+        )
+        if added_names:
+            write_json_file(
+                previous_file, [reorder_message_fields(m) for m in all_messages]
+            )
+            _emit(
+                log_callback,
+                f"  Added missing display_name to {added_names} previously saved messages.",
+            )
+    return previous_file, all_messages, checkpoint.get("last_timestamp")
+
+
+def _page_params(id_type: str, identifier: str, start_after_timestamp) -> dict:
+    params = {id_type: identifier, "limit": MAX_LIMIT}
+    if start_after_timestamp is not None:
+        params["start_after_timestamp"] = start_after_timestamp
+    return params
+
+
+def _show_progress(all_messages: list, progress_callback) -> None:
+    message = f"Downloading your chat history... ({len(all_messages):,} messages so far)"
+    if progress_callback:
+        progress_callback(len(all_messages), message)
+    else:
+        print(f"\r  {message}  ", end="", flush=True)
+
 
 def export_messages(
     api_key: str,
@@ -310,144 +414,61 @@ def export_messages(
     resume: bool = True,
     character_name: str = "",
     user_name: str = "",
+    resume_choice: bool | None = None,
+    cleanup_checkpoint_choice: bool | None = False,
+    progress_callback=None,
+    log_callback=None,
 ) -> int:
-    """
-    Paginate through /get-chat-messages and write every message to output_file.
-
-    Returns the total number of messages exported.
-
-    identifier     : the value of ai_id or group_id
-    id_type        : "ai_id" or "group_id"
-    character_name : optional local display_name for AI messages; only used
-                     when id_type is "ai_id"
-    user_name      : optional local display_name for user messages; only used
-                     when id_type is "ai_id"
-    """
-    headers = {"Authorization": f"Bearer {api_key}"}
+    """Paginate through Kindroid messages and write a complete JSON export."""
+    output_file = validated_path(output_file, root=APP_ROOT)
     all_messages: list = []
     start_after_timestamp = None
-
     if resume:
-        checkpoint = load_checkpoint(identifier)
-        if checkpoint:
-            previous_file = Path(checkpoint["output_file"])
-            if previous_file.exists():
-                print()
-                print("  It looks like a previous export was interrupted partway through.")
-                print(f"  File       : {previous_file}")
-                print(f"  Saved so far: {checkpoint.get('message_count', 0):,} messages")
-
-                choice = input("  Pick up where it left off? [Y/n]: ").strip().lower()
-                if choice in ("", "y", "yes"):
-                    output_file = previous_file
-                    start_after_timestamp = checkpoint.get("last_timestamp")
-                    try:
-                        all_messages = json.loads(
-                            output_file.read_text(encoding="utf-8")
-                        )
-                        if id_type == "ai_id":
-                            added_names = add_single_ai_display_names(
-                                all_messages,
-                                character_name=character_name,
-                                user_name=user_name,
-                            )
-                            if added_names:
-                                output_file.write_text(
-                                    json.dumps(
-                                        [reorder_message_fields(m) for m in all_messages],
-                                        indent=2,
-                                        ensure_ascii=False,
-                                    ),
-                                    encoding="utf-8",
-                                )
-                                print(
-                                    f"  Added missing display_name to {added_names} "
-                                    "previously saved messages."
-                                )
-                    except Exception:
-                        print("  Could not read previous output file. Starting fresh.")
-                        all_messages = []
-                        start_after_timestamp = None
-                else:
-                    print("  Starting a fresh export.")
-
-    page_number = 1
-
-    while True:
-        # The API accepts exactly one of ai_id or group_id — never both.
-        params: dict = {
-            id_type: identifier,
-            "limit": MAX_LIMIT,
-        }
-
-        if start_after_timestamp is not None:
-            # Must be a number (Unix ms timestamp), not a string.
-            params["start_after_timestamp"] = start_after_timestamp
-
-        print(
-            f"\r  Downloading your chat history... ({len(all_messages):,} messages so far)  ",
-            end="",
-            flush=True,
+        output_file, all_messages, start_after_timestamp = _load_resumable_export(
+            identifier, id_type, output_file, character_name, user_name,
+            resume_choice, log_callback,
         )
 
-        data = request_page_with_backoff(headers, params)
-
+    headers = {"Authorization": f"Bearer {api_key}"}
+    while True:
+        _show_progress(all_messages, progress_callback)
+        data = request_page_with_backoff(
+            headers,
+            _page_params(id_type, identifier, start_after_timestamp),
+            log_callback=log_callback,
+        )
         messages = data.get("messages", [])
         pagination = data.get("pagination", {})
-
         if not isinstance(messages, list):
             raise RuntimeError("Unexpected response: 'messages' was not a list.")
 
-        added_names = 0
         if id_type == "ai_id":
-            added_names = add_single_ai_display_names(
-                messages,
-                character_name=character_name,
-                user_name=user_name,
+            add_single_ai_display_names(
+                messages, character_name=character_name, user_name=user_name
             )
-
         all_messages.extend(messages)
-
-        output_file.write_text(
-            json.dumps(
-                [reorder_message_fields(m) for m in all_messages],
-                indent=2,
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
+        write_json_file(
+            output_file, [reorder_message_fields(m) for m in all_messages]
         )
 
         last_timestamp = pagination.get("lastTimestamp")
-        has_more = pagination.get("hasMore", False)
-        returned_limit = pagination.get("limit")
-
         save_checkpoint(
-            identifier=identifier,
-            id_type=id_type,
-            output_file=str(output_file),
-            last_timestamp=last_timestamp,
-            message_count=len(all_messages),
+            identifier, id_type, str(output_file), last_timestamp, len(all_messages)
         )
-
-        if not has_more:
-            print()
-            print()
-            print(f"  🎉 All done! Saved {len(all_messages):,} messages to {output_file}")
+        if not pagination.get("hasMore", False):
+            _emit(log_callback)
+            _emit(log_callback)
+            _emit(log_callback, f"  All done! Saved {len(all_messages):,} messages to {output_file}")
             break
-
         if last_timestamp is None:
             raise RuntimeError(
                 "Kindroid said there are more messages but did not return lastTimestamp."
             )
-
         start_after_timestamp = last_timestamp
-        page_number += 1
+        time.sleep(random.uniform(2.0, 5.0))
 
-        # Gentle pacing even when not rate-limited.
-        # Increase this if Kindroid is still hitting you with 429s.
-        sleep_for = random.uniform(2.0, 5.0)
-        time.sleep(sleep_for)
-
+    if cleanup_checkpoint_choice is not False:
+        cleanup_checkpoint(cleanup_checkpoint_choice)
     return len(all_messages)
 
 
@@ -458,6 +479,7 @@ def export_messages(
 def load_exported_messages(input_file: Path) -> list:
     """Read an exported Kindroid JSON file and return its message list."""
     try:
+        input_file = validated_path(input_file)
         data = json.loads(input_file.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ValueError(f"{input_file} is not valid JSON: {exc}") from exc
@@ -553,7 +575,7 @@ def export_as_jsonl(messages: list, output_file: Path):
         json.dumps(reorder_message_fields(message), ensure_ascii=False)
         for message in messages
     ]
-    output_file.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    validated_path(output_file).write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
 
 def export_as_plaintext(messages: list, output_file: Path):
@@ -565,7 +587,7 @@ def export_as_plaintext(messages: list, output_file: Path):
         body = message_text(message)
         blocks.append(f"{header}\n{body}" if body else header)
 
-    output_file.write_text("\n\n".join(blocks) + ("\n" if blocks else ""), encoding="utf-8")
+    validated_path(output_file).write_text("\n\n".join(blocks) + ("\n" if blocks else ""), encoding="utf-8")
 
 
 def escape_markdown_text(value: str) -> str:
@@ -588,7 +610,7 @@ def export_as_markdown(messages: list, output_file: Path, title: str):
         lines.append(body if body else "_No message text_")
         lines.append("")
 
-    output_file.write_text("\n".join(lines), encoding="utf-8")
+    validated_path(output_file).write_text("\n".join(lines), encoding="utf-8")
 
 
 def export_as_pdf(messages: list, output_file: Path, title: str):
@@ -619,7 +641,7 @@ def export_as_pdf(messages: list, output_file: Path, title: str):
         canvas.restoreState()
 
     doc = SimpleDocTemplate(
-        str(output_file),
+        str(validated_path(output_file)),
         pagesize=letter,
         rightMargin=0.65 * inch,
         leftMargin=0.65 * inch,
@@ -670,6 +692,7 @@ def export_as_pdf(messages: list, output_file: Path, title: str):
 
 
 def convert_export_file(input_file: Path, formats: list) -> list:
+    input_file = validated_path(input_file)
     messages = load_exported_messages(input_file)
     written = []
 
@@ -711,6 +734,7 @@ def run_export(api_key: str, session_log: list):
     export_type = input("  Choose [1/2, default 1]: ").strip()
 
     character_name = ""
+    group_export_name = ""
     user_name = ""
 
     if export_type == "2":
@@ -718,10 +742,14 @@ def run_export(api_key: str, session_log: list):
         print()
         print("  Your group ID can be found in the Kindroid app under Profile → Settings.")
         identifier = prompt_nonempty("  Enter the group ID: ")
+        group_export_name = input(
+            "  What should this group export be named? [use group ID]: "
+        ).strip()
         character_name = ""
         user_name = ""
         date_str = datetime.now().strftime("%Y%m%d")
-        default_name = f"Group_{safe_filename(identifier)}_Chat_Export_{date_str}.json"
+        filename_name = group_export_name or f"Group_{identifier}"
+        default_name = f"{safe_filename(filename_name)}_Chat_Export_{date_str}.json"
     else:
         id_type = "ai_id"
         print()
@@ -751,7 +779,7 @@ def run_export(api_key: str, session_log: list):
     entry = {
         "id_type": id_type,
         "identifier": identifier,
-        "character_name": character_name or identifier,
+        "character_name": character_name if id_type == "ai_id" else group_export_name or identifier,
         "output_file": str(output_file),
         "message_count": 0,
         "status": "failed",
@@ -799,7 +827,11 @@ def run_conversion():
     print("  Convert your downloaded chat exports to another format.")
     print()
     source_input = input("  Path to JSON file or folder [current folder]: ").strip()
-    source = Path(source_input or ".")
+    try:
+        source = validated_path(source_input or ".")
+    except ValueError as exc:
+        print(f"  Invalid path: {exc}")
+        return
 
     print()
     print("  What format would you like?")
@@ -942,7 +974,8 @@ def main():
                 if visibility_choice == "2":
                     api_key = input("  Paste your API key here: ").strip()
                     if api_key:
-                        print(f"  Key entered successfully ({len(api_key)} characters).")
+                        preview = api_key[:6] + "*" * max(0, len(api_key) - 6)
+                        print(f"  Key entered: {preview}  ({len(api_key)} characters)")
                 else:
                     api_key = getpass.getpass(
                         "  Paste your API key here (it won't be visible as you type): "
