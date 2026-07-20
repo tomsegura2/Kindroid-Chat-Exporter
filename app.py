@@ -119,9 +119,9 @@ def validated_path(value: str | Path, *, root: Path | None = None) -> Path:
     return candidate
 
 
-def write_json_file(output_file: Path, data) -> None:
-    """Write JSON consistently after validating the destination path."""
-    safe_output = validated_path(output_file)
+def write_json_file(output_file: Path, data, *, root: Path | None = APP_ROOT) -> None:
+    """Write JSON consistently after validating the destination path stays under root."""
+    safe_output = validated_path(output_file, root=root)
     safe_output.write_text(
         json.dumps(data, indent=2, ensure_ascii=False),
         encoding="utf-8",
@@ -479,7 +479,7 @@ def export_messages(
 def load_exported_messages(input_file: Path) -> list:
     """Read an exported Kindroid JSON file and return its message list."""
     try:
-        input_file = validated_path(input_file)
+        input_file = validated_path(input_file, root=APP_ROOT)
         data = json.loads(input_file.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ValueError(f"{input_file} is not valid JSON: {exc}") from exc
@@ -575,7 +575,9 @@ def export_as_jsonl(messages: list, output_file: Path):
         json.dumps(reorder_message_fields(message), ensure_ascii=False)
         for message in messages
     ]
-    validated_path(output_file).write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    validated_path(output_file, root=APP_ROOT).write_text(
+        "\n".join(lines) + ("\n" if lines else ""), encoding="utf-8"
+    )
 
 
 def export_as_plaintext(messages: list, output_file: Path):
@@ -587,7 +589,9 @@ def export_as_plaintext(messages: list, output_file: Path):
         body = message_text(message)
         blocks.append(f"{header}\n{body}" if body else header)
 
-    validated_path(output_file).write_text("\n\n".join(blocks) + ("\n" if blocks else ""), encoding="utf-8")
+    validated_path(output_file, root=APP_ROOT).write_text(
+        "\n\n".join(blocks) + ("\n" if blocks else ""), encoding="utf-8"
+    )
 
 
 def escape_markdown_text(value: str) -> str:
@@ -610,7 +614,7 @@ def export_as_markdown(messages: list, output_file: Path, title: str):
         lines.append(body if body else "_No message text_")
         lines.append("")
 
-    validated_path(output_file).write_text("\n".join(lines), encoding="utf-8")
+    validated_path(output_file, root=APP_ROOT).write_text("\n".join(lines), encoding="utf-8")
 
 
 def export_as_pdf(messages: list, output_file: Path, title: str):
@@ -641,7 +645,7 @@ def export_as_pdf(messages: list, output_file: Path, title: str):
         canvas.restoreState()
 
     doc = SimpleDocTemplate(
-        str(validated_path(output_file)),
+        str(validated_path(output_file, root=APP_ROOT)),
         pagesize=letter,
         rightMargin=0.65 * inch,
         leftMargin=0.65 * inch,
@@ -692,7 +696,7 @@ def export_as_pdf(messages: list, output_file: Path, title: str):
 
 
 def convert_export_file(input_file: Path, formats: list) -> list:
-    input_file = validated_path(input_file)
+    input_file = validated_path(input_file, root=APP_ROOT)
     messages = load_exported_messages(input_file)
     written = []
 
@@ -828,7 +832,7 @@ def run_conversion():
     print()
     source_input = input("  Path to JSON file or folder [current folder]: ").strip()
     try:
-        source = validated_path(source_input or ".")
+        source = validated_path(source_input or ".", root=APP_ROOT)
     except ValueError as exc:
         print(f"  Invalid path: {exc}")
         return
@@ -929,8 +933,42 @@ def show_session_summary(session_log: list):
 # Entry point
 # ---------------------------------------------------------------------------
 
-def main():
-    configure_console_encoding()
+def obtain_api_key() -> str:
+    """Prompt the user for their Kindroid API key. Returns "" if they cancel."""
+    print()
+    print("  Your API key can be found in the Kindroid app:")
+    print("  Profile → Settings → API Key")
+    print("  It starts with kn_ and stays on your computer — it is never uploaded.")
+    print()
+    print("  How would you like to enter your API key?")
+    print("    1) Hidden  — characters are invisible as you type (more secure)")
+    print("    2) Visible — characters appear as you type (easier to check for typos)")
+    print()
+    visibility_choice = input("  Choose [1/2, default 1]: ").strip()
+    print()
+
+    if visibility_choice == "2":
+        api_key = input("  Paste your API key here: ").strip()
+        if api_key:
+            preview = api_key[:6] + "*" * max(0, len(api_key) - 6)
+            print(f"  Key entered: {preview}  ({len(api_key)} characters)")
+    else:
+        api_key = getpass.getpass(
+            "  Paste your API key here (it won't be visible as you type): "
+        ).strip()
+
+    if api_key and not api_key.startswith("kn_"):
+        print()
+        print("  That doesn't look like a Kindroid API key (should start with kn_).")
+        confirm = input("  Continue anyway? [y/N]: ").strip().lower()
+        if confirm not in ("y", "yes"):
+            print("  Canceled — go back to the Kindroid app and copy the key again.")
+            return ""
+
+    return api_key
+
+
+def print_welcome():
     print_header()
     print()
     print("  Save your Kindroid chat history to your computer.")
@@ -943,68 +981,57 @@ def main():
     print("  the window at any time and pick up where you left off.")
     print()
 
+
+def print_main_menu():
+    print_divider()
+    print()
+    print("  Main menu")
+    print("    1) Download a chat export")
+    print("    2) Convert a downloaded export to PDF, text, or Markdown")
+    print("    3) View this session's exports")
+    print("    4) Exit")
+    print()
+
+
+def handle_menu_choice(choice: str, api_key: str, session_log: list) -> tuple[str, bool]:
+    """Dispatch a single main-menu choice. Returns (updated api_key, should_exit)."""
+    if choice == "1":
+        if not api_key:
+            api_key = obtain_api_key()
+            if not api_key:
+                return api_key, False
+        run_export(api_key, session_log)
+
+    elif choice == "2":
+        run_conversion()
+
+    elif choice == "3":
+        show_session_summary(session_log)
+
+    elif choice in ("4", ""):
+        show_session_summary(session_log)
+        print("  Goodbye!")
+        return api_key, True
+
+    else:
+        print("  Please enter 1, 2, 3, or 4.")
+
+    return api_key, False
+
+
+def main():
+    configure_console_encoding()
+    print_welcome()
+
     session_log: list = []
     api_key = ""
 
     while True:
-        print_divider()
-        print()
-        print("  Main menu")
-        print("    1) Download a chat export")
-        print("    2) Convert a downloaded export to PDF, text, or Markdown")
-        print("    3) View this session's exports")
-        print("    4) Exit")
-        print()
+        print_main_menu()
         choice = input("  Choose [1/2/3/4]: ").strip()
-
-        if choice == "1":
-            if not api_key:
-                print()
-                print("  Your API key can be found in the Kindroid app:")
-                print("  Profile → Settings → API Key")
-                print("  It starts with kn_ and stays on your computer — it is never uploaded.")
-                print()
-                print("  How would you like to enter your API key?")
-                print("    1) Hidden  — characters are invisible as you type (more secure)")
-                print("    2) Visible — characters appear as you type (easier to check for typos)")
-                print()
-                visibility_choice = input("  Choose [1/2, default 1]: ").strip()
-                print()
-
-                if visibility_choice == "2":
-                    api_key = input("  Paste your API key here: ").strip()
-                    if api_key:
-                        preview = api_key[:6] + "*" * max(0, len(api_key) - 6)
-                        print(f"  Key entered: {preview}  ({len(api_key)} characters)")
-                else:
-                    api_key = getpass.getpass(
-                        "  Paste your API key here (it won't be visible as you type): "
-                    ).strip()
-
-                if not api_key.startswith("kn_"):
-                    print()
-                    print("  That doesn't look like a Kindroid API key (should start with kn_).")
-                    confirm = input("  Continue anyway? [y/N]: ").strip().lower()
-                    if confirm not in ("y", "yes"):
-                        print("  Canceled — go back to the Kindroid app and copy the key again.")
-                        api_key = ""
-                        continue
-
-            run_export(api_key, session_log)
-
-        elif choice == "2":
-            run_conversion()
-
-        elif choice == "3":
-            show_session_summary(session_log)
-
-        elif choice in ("4", ""):
-            show_session_summary(session_log)
-            print("  Goodbye!")
+        api_key, should_exit = handle_menu_choice(choice, api_key, session_log)
+        if should_exit:
             break
-
-        else:
-            print("  Please enter 1, 2, 3, or 4.")
 
 
 if __name__ == "__main__":

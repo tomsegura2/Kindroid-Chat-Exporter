@@ -12,6 +12,9 @@ from tkinter import filedialog, messagebox, ttk
 
 import app
 
+JSON_GLOB_PATTERN = "*.json"
+JSON_FILETYPES = [("JSON files", JSON_GLOB_PATTERN), ("All files", "*.*")]
+
 
 class KindroidExporterGui(tk.Tk):
     def __init__(self):
@@ -34,6 +37,7 @@ class KindroidExporterGui(tk.Tk):
         self.export_type_var = tk.StringVar(value="ai_id")
         self.identifier_var = tk.StringVar()
         self.character_name_var = tk.StringVar()
+        self.group_export_name_var = tk.StringVar()
         self.user_name_var = tk.StringVar(value="User")
         self.output_file_var = tk.StringVar()
         self.resume_var = tk.BooleanVar(value=True)
@@ -108,6 +112,12 @@ class KindroidExporterGui(tk.Tk):
         self.character_label.grid(row=row, column=0, sticky="w", pady=4)
         self.character_entry = ttk.Entry(self.export_tab, textvariable=self.character_name_var)
         self.character_entry.grid(row=row, column=1, sticky="ew", pady=4)
+        row += 1
+
+        self.group_export_name_label = ttk.Label(self.export_tab, text="Group export name")
+        self.group_export_name_label.grid(row=row, column=0, sticky="w", pady=4)
+        self.group_export_name_entry = ttk.Entry(self.export_tab, textvariable=self.group_export_name_var)
+        self.group_export_name_entry.grid(row=row, column=1, sticky="ew", pady=4)
         row += 1
 
         self.user_label = ttk.Label(self.export_tab, text="Your display name")
@@ -225,11 +235,14 @@ class KindroidExporterGui(tk.Tk):
 
     def _update_export_type(self):
         is_single = self.export_type_var.get() == "ai_id"
-        state = "normal" if is_single else "disabled"
-        self.character_entry.configure(state=state)
-        self.user_entry.configure(state=state)
-        self.character_label.configure(state=state)
-        self.user_label.configure(state=state)
+        single_state = "normal" if is_single else "disabled"
+        group_state = "disabled" if is_single else "normal"
+        self.character_entry.configure(state=single_state)
+        self.user_entry.configure(state=single_state)
+        self.character_label.configure(state=single_state)
+        self.user_label.configure(state=single_state)
+        self.group_export_name_entry.configure(state=group_state)
+        self.group_export_name_label.configure(state=group_state)
 
     def _browse_output_file(self):
         default = self._default_output_file()
@@ -237,7 +250,7 @@ class KindroidExporterGui(tk.Tk):
             title="Save export as",
             initialfile=default.name,
             defaultextension=".json",
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            filetypes=JSON_FILETYPES,
         )
         if path:
             self.output_file_var.set(path)
@@ -245,7 +258,7 @@ class KindroidExporterGui(tk.Tk):
     def _browse_source_file(self):
         path = filedialog.askopenfilename(
             title="Select exported JSON",
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            filetypes=JSON_FILETYPES,
         )
         if path:
             self.source_var.set(path)
@@ -259,9 +272,43 @@ class KindroidExporterGui(tk.Tk):
         date_str = datetime.now().strftime("%Y%m%d")
         if self.export_type_var.get() == "group_id":
             identifier = self.identifier_var.get().strip() or "Group"
-            return Path(f"Group_{app.safe_filename(identifier)}_Chat_Export_{date_str}.json")
+            group_name = self.group_export_name_var.get().strip()
+            filename_name = group_name or f"Group_{identifier}"
+            return Path(f"{app.safe_filename(filename_name)}_Chat_Export_{date_str}.json")
         name = self.character_name_var.get().strip() or "Kindroid"
         return Path(f"{app.safe_filename(name)}_Chat_Export_{date_str}.json")
+
+    def _validate_export_form(self, api_key: str, identifier: str, id_type: str, character_name: str) -> bool:
+        """Validate the export form fields, showing an error dialog for the first problem found."""
+        if not api_key:
+            messagebox.showerror("Missing API key", "Enter your Kindroid API key.")
+            return False
+        if not api_key.startswith("kn_") and not messagebox.askyesno(
+            "API key check", "This key does not start with kn_. Continue anyway?"
+        ):
+            return False
+        if not identifier:
+            messagebox.showerror("Missing ID", "Enter the AI ID or group ID to export.")
+            return False
+        if id_type == "ai_id" and not character_name:
+            messagebox.showerror("Missing AI name", "Enter the AI display name for single-AI exports.")
+            return False
+        return True
+
+    def _maybe_prompt_resume(self, identifier: str) -> bool | None:
+        """Ask the user whether to resume from an existing checkpoint, if one is found."""
+        if not self.resume_var.get():
+            return None
+        checkpoint = app.load_checkpoint(identifier)
+        if not checkpoint or not Path(checkpoint.get("output_file", "")).exists():
+            return None
+        return messagebox.askyesno(
+            "Resume checkpoint",
+            "A checkpoint exists for this ID.\n\n"
+            f"File: {checkpoint.get('output_file')}\n"
+            f"Saved messages: {checkpoint.get('message_count', 0):,}\n\n"
+            "Resume from it?",
+        )
 
     def _start_export(self):
         if self.worker and self.worker.is_alive():
@@ -272,38 +319,20 @@ class KindroidExporterGui(tk.Tk):
         identifier = self.identifier_var.get().strip()
         id_type = self.export_type_var.get()
         character_name = self.character_name_var.get().strip()
+        group_export_name = self.group_export_name_var.get().strip()
         user_name = self.user_name_var.get().strip() or "User"
 
-        if not api_key:
-            messagebox.showerror("Missing API key", "Enter your Kindroid API key.")
-            return
-        if not api_key.startswith("kn_"):
-            if not messagebox.askyesno("API key check", "This key does not start with kn_. Continue anyway?"):
-                return
-        if not identifier:
-            messagebox.showerror("Missing ID", "Enter the AI ID or group ID to export.")
-            return
-        if id_type == "ai_id" and not character_name:
-            messagebox.showerror("Missing AI name", "Enter the AI display name for single-AI exports.")
+        if not self._validate_export_form(api_key, identifier, id_type, character_name):
             return
 
-        output_file = Path(self.output_file_var.get().strip()) if self.output_file_var.get().strip() else self._default_output_file()
-        resume_choice = None
-        if self.resume_var.get():
-            checkpoint = app.load_checkpoint(identifier)
-            if checkpoint and Path(checkpoint.get("output_file", "")).exists():
-                resume_choice = messagebox.askyesno(
-                    "Resume checkpoint",
-                    "A checkpoint exists for this ID.\n\n"
-                    f"File: {checkpoint.get('output_file')}\n"
-                    f"Saved messages: {checkpoint.get('message_count', 0):,}\n\n"
-                    "Resume from it?",
-                )
+        output_file_text = self.output_file_var.get().strip()
+        output_file = Path(output_file_text) if output_file_text else self._default_output_file()
+        resume_choice = self._maybe_prompt_resume(identifier)
 
         entry = {
             "id_type": id_type,
             "identifier": identifier,
-            "character_name": character_name or identifier,
+            "character_name": character_name if id_type == "ai_id" else group_export_name or identifier,
             "output_file": str(output_file),
             "message_count": 0,
             "status": "failed",
@@ -389,7 +418,9 @@ class KindroidExporterGui(tk.Tk):
         converted = 0
         try:
             if source.is_dir():
-                input_files = sorted(file for file in source.glob("*.json") if file.name != app.CHECKPOINT_FILE.name)
+                input_files = sorted(
+                    file for file in source.glob(JSON_GLOB_PATTERN) if file.name != app.CHECKPOINT_FILE.name
+                )
             else:
                 input_files = [source]
 
