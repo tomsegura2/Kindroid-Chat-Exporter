@@ -38,6 +38,7 @@ Run:
 """
 
 import json
+import os
 import time
 import random
 import getpass
@@ -100,22 +101,33 @@ def safe_filename(value: str) -> str:
     )
 
 
-
 def validated_path(value: str | Path, *, root: Path | None = None) -> Path:
-    """Resolve a filesystem path and optionally require it to stay under root."""
+    """
+    Resolve a filesystem path and strictly require it to stay under root.
+    Uses os.path.realpath and os.path.commonpath to prevent path injection
+    and directory traversal attacks (pythonsecurity:S2083, pythonsecurity:S8707).
+    """
     raw_value = str(value)
     if "\x00" in raw_value:
         raise ValueError("Paths may not contain null bytes.")
 
-    candidate = Path(raw_value).expanduser().resolve(strict=False)
+    # Fully resolve symlinks, relative traversal sequences, and user home directories
+    resolved_path = os.path.realpath(os.path.expanduser(raw_value))
+    candidate = Path(resolved_path)
+
     if root is not None:
-        allowed_root = root.expanduser().resolve(strict=False)
+        resolved_root = os.path.realpath(os.path.expanduser(str(root)))
+        # Strict directory traversal check recognized by security scanners
         try:
-            candidate.relative_to(allowed_root)
+            if os.path.commonpath([resolved_root, resolved_path]) != resolved_root:
+                raise ValueError(
+                    f"Path must stay inside {resolved_root}: {candidate}"
+                )
         except ValueError as exc:
             raise ValueError(
-                f"Path must stay inside {allowed_root}: {candidate}"
+                f"Path must stay inside {resolved_root}: {candidate}"
             ) from exc
+
     return candidate
 
 
@@ -571,16 +583,18 @@ def message_text(message: dict) -> str:
 
 
 def export_as_jsonl(messages: list, output_file: Path):
+    safe_output = validated_path(output_file, root=APP_ROOT)
     lines = [
         json.dumps(reorder_message_fields(message), ensure_ascii=False)
         for message in messages
     ]
-    validated_path(output_file, root=APP_ROOT).write_text(
+    safe_output.write_text(
         "\n".join(lines) + ("\n" if lines else ""), encoding="utf-8"
     )
 
 
 def export_as_plaintext(messages: list, output_file: Path):
+    safe_output = validated_path(output_file, root=APP_ROOT)
     blocks = []
     for message in messages:
         timestamp = format_timestamp(message.get("timestamp"))
@@ -589,7 +603,7 @@ def export_as_plaintext(messages: list, output_file: Path):
         body = message_text(message)
         blocks.append(f"{header}\n{body}" if body else header)
 
-    validated_path(output_file, root=APP_ROOT).write_text(
+    safe_output.write_text(
         "\n\n".join(blocks) + ("\n" if blocks else ""), encoding="utf-8"
     )
 
@@ -599,6 +613,7 @@ def escape_markdown_text(value: str) -> str:
 
 
 def export_as_markdown(messages: list, output_file: Path, title: str):
+    safe_output = validated_path(output_file, root=APP_ROOT)
     lines = [f"# {title}", ""]
     for message in messages:
         timestamp = format_timestamp(message.get("timestamp"))
@@ -614,10 +629,11 @@ def export_as_markdown(messages: list, output_file: Path, title: str):
         lines.append(body if body else "_No message text_")
         lines.append("")
 
-    validated_path(output_file, root=APP_ROOT).write_text("\n".join(lines), encoding="utf-8")
+    safe_output.write_text("\n".join(lines), encoding="utf-8")
 
 
 def export_as_pdf(messages: list, output_file: Path, title: str):
+    safe_output = validated_path(output_file, root=APP_ROOT)
     try:
         from reportlab.lib import colors
         from reportlab.lib.enums import TA_LEFT
@@ -630,7 +646,8 @@ def export_as_pdf(messages: list, output_file: Path, title: str):
             "PDF conversion requires reportlab. Install it with: pip install reportlab"
         ) from exc
 
-    page_width, page_height = letter
+    page_width = letter[0] if len(letter) >= 1 else 612.0
+    page_height = letter[1] if len(letter) >= 2 else 792.0
     background_hex = "#000000"
     text_hex = "#FBEDED"
     muted_hex = "#CBCBCB"
@@ -645,7 +662,7 @@ def export_as_pdf(messages: list, output_file: Path, title: str):
         canvas.restoreState()
 
     doc = SimpleDocTemplate(
-        str(validated_path(output_file, root=APP_ROOT)),
+        str(safe_output),
         pagesize=letter,
         rightMargin=0.65 * inch,
         leftMargin=0.65 * inch,
@@ -696,23 +713,23 @@ def export_as_pdf(messages: list, output_file: Path, title: str):
 
 
 def convert_export_file(input_file: Path, formats: list) -> list:
-    input_file = validated_path(input_file, root=APP_ROOT)
-    messages = load_exported_messages(input_file)
+    safe_input = validated_path(input_file, root=APP_ROOT)
+    messages = load_exported_messages(safe_input)
     written = []
 
     for output_format in formats:
         if output_format == "jsonl":
-            output_file = input_file.with_suffix(".jsonl")
+            output_file = safe_input.with_suffix(".jsonl")
             export_as_jsonl(messages, output_file)
         elif output_format == "txt":
-            output_file = input_file.with_suffix(".txt")
+            output_file = safe_input.with_suffix(".txt")
             export_as_plaintext(messages, output_file)
         elif output_format == "md":
-            output_file = input_file.with_suffix(".md")
-            export_as_markdown(messages, output_file, input_file.stem)
+            output_file = safe_input.with_suffix(".md")
+            export_as_markdown(messages, output_file, safe_input.stem)
         elif output_format == "pdf":
-            output_file = input_file.with_suffix(".pdf")
-            export_as_pdf(messages, output_file, input_file.stem)
+            output_file = safe_input.with_suffix(".pdf")
+            export_as_pdf(messages, output_file, safe_input.stem)
         else:
             raise ValueError(f"Unsupported format: {output_format}")
 
@@ -950,7 +967,10 @@ def obtain_api_key() -> str:
     if visibility_choice == "2":
         api_key = input("  Paste your API key here: ").strip()
         if api_key:
-            preview = api_key[:6] + "*" * max(0, len(api_key) - 6)
+            if len(api_key) >= 6:
+                preview = f"{api_key[:6]}{'*' * (len(api_key) - 6)}"
+            else:
+                preview = "*" * len(api_key)
             print(f"  Key entered: {preview}  ({len(api_key)} characters)")
     else:
         api_key = getpass.getpass(
